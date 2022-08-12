@@ -1,9 +1,13 @@
 const fs = require("fs");
 const axios = require("axios");
+require("dotenv").config();
 const DOMParser = require("xmldom").DOMParser;
 const createCsvWriter = require("csv-writer").createObjectCsvWriter;
+const argv = require("minimist")(process.argv.slice(2));
 
-const authToken = "enctoken <kite_auth_token_taken_from_browser_console>";
+const authToken = process.env.KITE_TOKEN;
+
+let dir = "";
 
 (async () => {
 	try {
@@ -14,12 +18,17 @@ const authToken = "enctoken <kite_auth_token_taken_from_browser_console>";
 })();
 
 async function main() {
-	const portfolioStocks = await getStocksInKitePortfolio();
-	// let portfolioStocks = JSON.parse(
-	// 	require("fs").readFileSync("list.json", "utf8")
-	// ).map((ticker) => ({ ticker }));
+	let portfolioStocks;
+	if (argv.m === "portfolio") {
+		portfolioStocks = await getStocksInKitePortfolio();
+	} else if (argv.m === "all") {
+		portfolioStocks = JSON.parse(
+			require("fs").readFileSync("list.json", "utf8")
+		).map((ticker) => ({ ticker }));
+	}
 
 	await getAdditionalDetailsOfStocks(portfolioStocks);
+	calculatePercentages(portfolioStocks);
 	await writeToCSV(portfolioStocks);
 }
 
@@ -50,10 +59,12 @@ async function getStocksInKitePortfolio() {
 async function getAdditionalDetailsOfStocks(portfolioStocks) {
 	const renameStock = getStocksToRename();
 
-	for (const stock of portfolioStocks) {
+	for (const [index, stock] of portfolioStocks.entries()) {
 		stock.ticker = renameStock.has(stock.ticker)
 			? renameStock.get(stock.ticker)
 			: stock.ticker;
+
+		writeToFile(false, index + " | " + stock.ticker + " ! ");
 
 		const html = await getStockHTML(stock.ticker);
 		let json = getJSONFromHTML(html, stock.ticker);
@@ -71,12 +82,14 @@ async function getAdditionalDetailsOfStocks(portfolioStocks) {
 			stock.sector = stockInfo.sector;
 			stock.tickertapeURL =
 				"https://stocks.tickertape.in/" + stock.ticker;
+
+			getSmallcaseData(json, stock);
+			await getExpertForecast(json, stock);
+			writeToFile(false, "processed\n");
 		}
 
-		getSmallcaseData(json, stock);
-		await getExpertForecast(json, stock);
-
 		writeToFile(true, stock);
+		logCompletionPercent(index, portfolioStocks.length);
 	}
 }
 
@@ -89,19 +102,20 @@ async function getStockHTML(stockName) {
 		return parser.parseFromString(body.data, "text/xml");
 	} catch (err) {
 		console.log(stockName + " - API errror");
-		writeToFile(false, "Error in API call");
+		writeToFile(false, "Error in API call\n");
 	}
 }
 
 function getStocksToRename() {
 	const renameStock = new Map();
 	renameStock.set("FLUOROCHEM-BE", "FLUOROCHEM");
+	renameStock.set("AWL-BE", "AWL");
 	return renameStock;
 }
 
 function getJSONFromHTML(document, stockName) {
 	if (!document) {
-		writeToFile(false, stockName + " - Data Not Found\n");
+		writeToFile(false, "Data Not Found\n");
 		console.log(stockName + " - Data Not Found");
 		return null;
 	}
@@ -117,7 +131,7 @@ function getJSONFromHTML(document, stockName) {
 		val.smallcases = pageProps.peers.data.smallcases;
 		return val;
 	} else {
-		writeToFile(false, stockName + " - Data Not Found\n");
+		writeToFile(false, "Data Not Found\n");
 		console.log(stockName + " - Data Not Found");
 		return null;
 	}
@@ -140,7 +154,6 @@ function getSmallcaseData(json, stock) {
 
 async function getExpertForecast(json, stock) {
 	if (json && json.tickertapeId) {
-		console.log("id:", json.tickertapeId);
 		const body = await axios.get(
 			"https://api.tickertape.in/stocks/summary/" + json.tickertapeId
 		);
@@ -158,34 +171,75 @@ async function getExpertForecast(json, stock) {
 	}
 }
 
+function calculatePercentages(stocks) {
+	let portfolioBuyPriceSum = 0;
+	let portfolioCurrentPriceSum = 0;
+	stocks.forEach((obj) => {
+		portfolioBuyPriceSum += obj.avgBuyingPrice;
+		portfolioCurrentPriceSum += obj.lastPrice;
+	});
+
+	stocks.forEach((obj) => {
+		obj.avgBuyPriceTotal = obj.avgBuyingPrice * obj.qty;
+		obj.currentPriceTotal = obj.lastPrice * obj.qty;
+		obj.profitLoss = obj.currentPriceTotal - obj.avgBuyPriceTotal;
+		obj.percentProfitLoss =
+			((obj.currentPriceTotal - obj.avgBuyPriceTotal) /
+				obj.avgBuyPriceTotal) *
+			100;
+		obj.percentInPortfolio =
+			(obj.currentPriceTotal * 100) / portfolioCurrentPriceSum;
+	});
+}
+
 function getDate() {
 	const currentDate = new Date();
 	const day = currentDate.getDate();
 	const month = currentDate.getMonth() + 1;
 	const year = currentDate.getFullYear();
+	const hour = currentDate.getHours();
+	const min = currentDate.getMinutes();
+	const sec = currentDate.getSeconds();
 
-	return day + "-" + month + "-" + year;
+	return day + "-" + month + "-" + year + "/" + hour + "-" + min + "-" + sec;
 }
 
 function writeToFile(isResult, content) {
-	let fileName = isResult
-		? "./output/result" + getDate() + ".json"
-		: "./output/log" + getDate() + ".txt";
+	createOutputDir();
+	let fileName = isResult ? dir + "/result.json" : dir + "/log.txt";
 	content = isResult ? JSON.stringify(content) + "," : content;
 	fs.appendFileSync(fileName, content, function (err) {
 		if (err) throw err;
 	});
 }
 
+function createOutputDir() {
+	if (dir === "") {
+		dir = "./output/" + getDate();
+	}
+
+	if (!fs.existsSync(dir)) {
+		fs.mkdirSync(dir, { recursive: true });
+	}
+}
+
 async function writeToCSV(obj) {
+	createOutputDir();
+	const path = dir + "/portfolio.csv";
+
 	const csvWriter = createCsvWriter({
-		path: "./output/portfolio.csv",
+		path: path,
 		header: [
 			{ id: "name", title: "Name" },
 			{ id: "ticker", title: "Ticker" },
 			{ id: "qty", title: "Quantity" },
 			{ id: "avgBuyingPrice", title: "Average Buying Price" },
 			{ id: "lastPrice", title: "Last Price" },
+			{ id: "avgBuyPriceTotal", title: "Total Buy Price" },
+			{ id: "currentPriceTotal", title: "Total Current Price" },
+			{ id: "profitLoss", title: "P&L" },
+			{ id: "percentProfitLoss", title: "P&L Precent" },
+			{ id: "percentInPortfolio", title: "Percent Size in Portfolio" },
 			{ id: "description", title: "Description" },
 			{ id: "sector", title: "Sector" },
 			{ id: "smallcases", title: "Smallcases" },
@@ -199,4 +253,14 @@ async function writeToCSV(obj) {
 	});
 
 	await csvWriter.writeRecords(obj);
+	console.log("CSV created at: " + path);
+}
+
+function logCompletionPercent(i, total) {
+	process.stdout.write(".");
+	if ((i + 1) % 10 == 0) {
+		console.log(
+			"\r\n==== completion " + (i + 1) + " of " + total + " ====\r\n"
+		);
+	}
 }
